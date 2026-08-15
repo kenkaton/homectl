@@ -10,6 +10,7 @@ import { notifySafe } from "./notify/types";
 import { createNotifier } from "./notify";
 import type { Env } from "./env";
 import * as store from "./store";
+import { writeTelemetry } from "./telemetry";
 import { jstDay, jstDateTime } from "./util/time";
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000; // D7: 既定 5 分。1 分に縮めない（wall-clock 課金が 5 倍になる）
@@ -93,7 +94,8 @@ export class SiteDO extends DurableObject<Env> {
       if (!readable) continue;
       try {
         const state = await adapter.readState(device);
-        store.mergeState(this.sql, device.id, state, "poll", now);
+        const merged = store.mergeState(this.sql, device.id, state, "poll", now);
+        writeTelemetry(this.env.TELEMETRY, device, merged);
       } catch (e) {
         if (e instanceof BudgetExceededError) return; // このサイクルは打ち切り
         console.error(`poll failed for ${device.id}:`, e instanceof Error ? e.message : String(e));
@@ -226,10 +228,12 @@ export class SiteDO extends DurableObject<Env> {
   /** ダッシュボード用スナップショット（読み取り専用） */
   async dashData(): Promise<{
     generatedAt: string;
+    now: number;
     devices: Array<{
       device: Device;
       state: DeviceState | null;
       updatedAt: string | null;
+      updatedAtMs: number | null;
       source: string | null;
     }>;
     rateBudget: Array<{ vendor: string; used: number; dailyLimit: number }>;
@@ -238,10 +242,12 @@ export class SiteDO extends DurableObject<Env> {
     const states = await this.getStateRpc();
     return {
       generatedAt: jstDateTime(Date.now()),
+      now: Date.now(),
       devices: states.map((s) => ({
         device: s.device,
         state: s.state,
         updatedAt: s.updatedAt === null ? null : jstDateTime(s.updatedAt),
+        updatedAtMs: s.updatedAt,
         source: s.source,
       })),
       rateBudget: (await this.getRateBudgetRpc()).map((b) => ({
