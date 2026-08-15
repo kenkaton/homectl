@@ -2,12 +2,18 @@
 // 全状態は SQLite に置き、コンストラクタで再構築する（D9）。インスタンスフィールドは
 // 設定由来（env から毎回同じものが作れる）のものだけ。
 import { DurableObject } from "cloudflare:workers";
-import type { Device, DeviceState, VendorAdapter } from "./adapters/types";
+import { z } from "zod";
+import type { Action, Device, DeviceState, VendorAdapter } from "./adapters/types";
 import { BudgetExceededError } from "./adapters/http";
 import { createAdapters, isConfigured } from "./adapters";
 import type { Notifier } from "./notify/types";
 import { notifySafe } from "./notify/types";
 import { createNotifier } from "./notify";
+import type { ActionOutcome } from "./safety/enforce";
+import { evaluateExpectation, executeAction } from "./safety/enforce";
+import { LIMITS } from "./safety/limits";
+import { evaluateRules } from "./rules/engine";
+import { rules } from "../rules/index";
 import type { Env } from "./env";
 import * as store from "./store";
 import { writeTelemetry } from "./telemetry";
@@ -52,6 +58,9 @@ export class SiteDO extends DurableObject<Env> {
       const now = Date.now();
       await this.maybeDiscoverDevices(now);
       await this.pollAll(now);
+      await this.processVerifications(now); // ポーリング直後 = via の最新値で判定できる
+      await this.runRules("alarm");
+      this.pruneOldRows(now);
     } catch (e) {
       // アラーム全体を落とす例外はここで吸収（個別処理は各所で catch 済み）
       console.error("alarm cycle failed:", e instanceof Error ? e.message : String(e));
@@ -59,6 +68,90 @@ export class SiteDO extends DurableObject<Env> {
       // 例外時もアラーム連鎖を切らさない（§9-2）
       await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
+  }
+
+  // ---- ルール評価（速いループ本体） ----
+
+  private async runRules(trigger: "alarm" | "webhook", rooms?: string[]): Promise<void> {
+    await evaluateRules(
+      {
+        sql: this.sql,
+        adapters: this.adapters,
+        notifier: this.notifier,
+        telemetry: this.env.TELEMETRY,
+        rules,
+        now: () => Date.now(),
+        random: () => Math.random(),
+      },
+      trigger,
+      rooms,
+    );
+  }
+
+  // ---- 閉ループ検証（D5: assumed/inferred 操作の実効確認） ----
+
+  private async processVerifications(now: number): Promise<void> {
+    const expectSchema = z.object({
+      via: z.string(),
+      metric: z.literal("powerW"),
+      op: z.enum([">=", "<="]),
+      value: z.number(),
+    });
+    const due = this.sql
+      .exec<{ id: number; op_log_id: number; device_id: string; check_after: number; expect: string }>(
+        "SELECT * FROM pending_verifications WHERE check_after <= ?",
+        now,
+      )
+      .toArray();
+    for (const row of due) {
+      const parsed = expectSchema.safeParse(JSON.parse(row.expect));
+      const finish = (verification: string): void => {
+        this.sql.exec("UPDATE operation_log SET verification = ? WHERE id = ?", verification, row.op_log_id);
+        this.sql.exec("DELETE FROM pending_verifications WHERE id = ?", row.id);
+      };
+      if (!parsed.success) {
+        finish("failed:bad_expectation");
+        continue;
+      }
+      const expect = parsed.data;
+      const via = store.getCachedState(this.sql, expect.via);
+      const staleLimitMs = LIMITS.verification.staleAfterMinutes * 60_000;
+      const fresh = via && now - via.updatedAt < staleLimitMs;
+      if (!fresh) {
+        if (now - row.check_after < staleLimitMs) continue; // 次のアラームでもう一度見る
+        finish("failed:via_stale");
+        await notifySafe(this.notifier, {
+          level: "alert",
+          kind: "verification_failed",
+          title: `操作検証ができない: ${row.device_id}`,
+          detail: `根拠機器 ${expect.via} のデータが古い（検証条件 ${expect.metric}${expect.op}${expect.value}）`,
+          deviceId: row.device_id,
+        });
+        continue;
+      }
+      const measured = via.state[expect.metric];
+      const ok = typeof measured === "number" && evaluateExpectation(expect, measured);
+      const summary = `${expect.metric}=${typeof measured === "number" ? Math.round(measured) : "n/a"} expected${expect.op}${expect.value}`;
+      finish(ok ? `ok:${summary}` : `failed:${summary}`);
+      if (!ok) {
+        await notifySafe(this.notifier, {
+          level: "alert",
+          kind: "verification_failed",
+          title: `送った操作が効いていない可能性: ${row.device_id}`,
+          detail: summary + `（根拠機器 ${expect.via}）`,
+          deviceId: row.device_id,
+        });
+      }
+    }
+  }
+
+  /** 古い操作ログ等の掃除（日付が変わったときに 1 回だけ） */
+  private pruneOldRows(now: number): void {
+    const today = jstDay(now);
+    if (store.getKv(this.sql, "last_prune_day") === today) return;
+    store.setKv(this.sql, "last_prune_day", today);
+    this.sql.exec("DELETE FROM operation_log WHERE ts < ?", now - 60 * 24 * 3600_000); // 60日
+    this.sql.exec("DELETE FROM pending_verifications WHERE check_after < ?", now - 24 * 3600_000);
   }
 
   // ---- 機器発見（24h ごと / 初回すぐ） ----
@@ -210,6 +303,142 @@ export class SiteDO extends DurableObject<Env> {
         source: cached?.source ?? null,
       };
     });
+  }
+
+  /** 機器操作。必ず安全層（enforce）経由（D3）。blocked 理由も outcome で返す */
+  async setStateRpc(
+    deviceIdOrName: string,
+    action: Action,
+    actor: string,
+    reason?: string,
+  ): Promise<ActionOutcome & { device?: { id: string; name: string } }> {
+    await this.ensureNextAlarm();
+    const device = store.getDevice(this.sql, deviceIdOrName);
+    if (!device) {
+      return { ok: false, result: `error:device_not_found:${deviceIdOrName}`, opLogId: -1, verification: "none" };
+    }
+    const outcome = await executeAction(
+      {
+        sql: this.sql,
+        adapters: this.adapters,
+        notifier: this.notifier,
+        telemetry: this.env.TELEMETRY,
+        now: () => Date.now(),
+      },
+      device,
+      action,
+      actor,
+      reason ?? "手動操作（理由の記載なし）",
+    );
+    return { ...outcome, device: { id: device.id, name: device.name } };
+  }
+
+  /** キルスイッチ。"on" で全操作拒否（safety/enforce が参照） */
+  async setKillSwitchRpc(on: boolean, actor: string): Promise<{ killSwitch: boolean }> {
+    const now = Date.now();
+    store.setKv(this.sql, LIMITS.global.killSwitchKey, on ? "on" : "off");
+    this.sql.exec(
+      "INSERT INTO operation_log (ts, actor, device_id, action, reason, result, verification) VALUES (?, ?, NULL, ?, ?, 'ok', NULL)",
+      now,
+      actor,
+      JSON.stringify({ type: "set_kill_switch", value: on }),
+      on ? "全機器の自動・手動操作を停止" : "操作を再開",
+    );
+    await notifySafe(this.notifier, {
+      level: "alert",
+      kind: "kill_switch",
+      title: `キルスイッチ ${on ? "ON — 全操作停止" : "OFF — 操作再開"}`,
+      detail: `actor: ${actor}`,
+    });
+    return { killSwitch: on };
+  }
+
+  /** 直近の操作ログ（新しい順）。D10: なぜ動いたかに即答するための一次データ */
+  async recentOperationsRpc(limit = 20): Promise<
+    Array<{
+      id: number;
+      ts: number;
+      at: string;
+      actor: string;
+      deviceId: string | null;
+      deviceName: string | null;
+      action: string;
+      reason: string;
+      result: string;
+      verification: string | null;
+    }>
+  > {
+    const n = Math.min(200, Math.max(1, Math.floor(limit)));
+    return this.sql
+      .exec<{
+        id: number;
+        ts: number;
+        actor: string;
+        device_id: string | null;
+        action: string;
+        reason: string;
+        result: string;
+        verification: string | null;
+        device_name: string | null;
+      }>(
+        `SELECT o.*, d.name AS device_name FROM operation_log o
+         LEFT JOIN devices d ON d.id = o.device_id
+         ORDER BY o.id DESC LIMIT ?`,
+        n,
+      )
+      .toArray()
+      .map((r) => ({
+        id: r.id,
+        ts: r.ts,
+        at: jstDateTime(r.ts),
+        actor: r.actor,
+        deviceId: r.device_id,
+        deviceName: r.device_name,
+        action: r.action,
+        reason: r.reason,
+        result: r.result,
+        verification: r.verification,
+      }));
+  }
+
+  /** 機器の整理（表示名・部屋・能力の feedback/via 上書き）。発見データは消さない */
+  async updateDeviceRpc(
+    deviceIdOrName: string,
+    patch: {
+      name?: string;
+      room?: string;
+      capabilityOverride?: { capability: string; feedback: "verified" | "assumed" | "inferred"; via?: string };
+    },
+  ): Promise<{ ok: boolean; device?: Device; error?: string }> {
+    const device = store.getDevice(this.sql, deviceIdOrName);
+    if (!device) return { ok: false, error: `device_not_found:${deviceIdOrName}` };
+    const name = patch.name ?? device.name;
+    const room = patch.room ?? device.room;
+    let capabilities = device.capabilities;
+    if (patch.capabilityOverride) {
+      const o = patch.capabilityOverride;
+      if (o.feedback === "inferred" && !o.via) {
+        return { ok: false, error: "inferred には via（根拠機器の id）が必要" };
+      }
+      if (o.via && !store.getDevice(this.sql, o.via)) {
+        return { ok: false, error: `via の機器が見つからない: ${o.via}` };
+      }
+      let found = false;
+      capabilities = device.capabilities.map((c) => {
+        if (c.capability !== o.capability) return c;
+        found = true;
+        return { capability: c.capability, feedback: o.feedback, via: o.via };
+      });
+      if (!found) return { ok: false, error: `機器が能力 ${o.capability} を持っていない` };
+    }
+    this.sql.exec(
+      "UPDATE devices SET name = ?, room = ?, capabilities = ? WHERE id = ?",
+      name,
+      room,
+      JSON.stringify(capabilities),
+      device.id,
+    );
+    return { ok: true, device: store.getDevice(this.sql, device.id) ?? undefined };
   }
 
   async getRateBudgetRpc(): Promise<

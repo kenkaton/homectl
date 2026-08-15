@@ -97,4 +97,54 @@ describe("SiteDO アラーム 1 周（発見 → ポーリング → state_cache
     const states = await stub.getStateRpc();
     expect(states[0]?.state).toBeNull(); // ポーリングされていない
   });
+
+  it("閉ループ検証: 期限到来分をアラームで判定し、効いていなければ failed を記録（D5）", async () => {
+    mockFetch({}); // 実 HTTP は全て遮断（discovery の失敗は握って続行される）
+    const stub = siteStub();
+    const now = Date.now();
+    await runInDurableObject(stub, (_i, state) => {
+      const sql = state.storage.sql;
+      // via 機器（プラグ）の最新値: 500W
+      sql.exec(
+        "INSERT INTO devices (id, vendor, vendor_device_id, name, room, capabilities) VALUES ('plug','fake','p','プラグ','bedroom','[]')",
+      );
+      sql.exec(
+        "INSERT INTO state_cache (device_id, state, updated_at, source) VALUES ('plug', ?, ?, 'poll')",
+        JSON.stringify({ powerW: 500 }),
+        now,
+      );
+      sql.exec("INSERT INTO kv (key, value) VALUES ('last_discovery', ?)", String(now));
+      // 操作ログ 2 件: ON(500W>=100 で ok になるはず) / OFF(500W<=50 で failed になるはず)
+      for (const [id, expectJson] of [
+        [1, { via: "plug", metric: "powerW", op: ">=", value: 100 }],
+        [2, { via: "plug", metric: "powerW", op: "<=", value: 50 }],
+      ] as const) {
+        sql.exec(
+          "INSERT INTO operation_log (id, ts, actor, device_id, action, reason, result, verification) VALUES (?, ?, 'rule:x', 'ac', '{}', 'r', 'ok', 'pending')",
+          id,
+          now - 6 * 60_000,
+        );
+        sql.exec(
+          "INSERT INTO pending_verifications (op_log_id, device_id, check_after, expect) VALUES (?, 'ac', ?, ?)",
+          id,
+          now - 1000,
+          JSON.stringify(expectJson),
+        );
+      }
+    });
+
+    await runDurableObjectAlarm(stub);
+
+    const rows = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql
+        .exec<{ id: number; verification: string }>("SELECT id, verification FROM operation_log ORDER BY id")
+        .toArray(),
+    );
+    expect(rows[0]?.verification).toBe("ok:powerW=500 expected>=100");
+    expect(rows[1]?.verification).toBe("failed:powerW=500 expected<=50");
+    const pending = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql.exec("SELECT * FROM pending_verifications").toArray(),
+    );
+    expect(pending).toHaveLength(0);
+  });
 });
