@@ -1,0 +1,20 @@
+{
+  "name": "homectl",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "SITE", "class_name": "SiteDO" }]
+  },
+  "migrations": [
+    // 必ず SQLite で作る（in-memory を持たない設計 D9 の前提）
+    { "tag": "v1", "new_sqlite_classes": ["SiteDO"] }
+  ],
+  "analytics_engine_datasets": [
+    { "binding": "TELEMETRY", "dataset": "homectl_telemetry" }
+  ],
+  "vars": {
+    // 通知実装の選択スイッチ（§11）。未設定/不明値は ConsoleNotifier にフォールバック
+    "NOTIFIER": "slack"
+  },
+  "observability": { "enabled": true }
+}

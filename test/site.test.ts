@@ -1,0 +1,100 @@
+// Phase 1 完了条件のテスト: 温湿度がアラームごとに state_cache に入る。
+// 実 DO（workerd + SQLite）でアラーム 1 周を回し、SwitchBot API はグローバル fetch モックで偽装する。
+import { abortAllDurableObjects, env, reset, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { jstDay } from "../src/util/time";
+import { mockFetch } from "./helpers";
+
+beforeEach(async () => {
+  // v0.21 は per-test isolated storage を持たないため、自前でテスト間を隔離する
+  await reset();
+  await abortAllDurableObjects();
+});
+
+afterEach(() => {
+  // 各テストで張ったグローバルモックを確実に剥がす
+  vi.unstubAllGlobals();
+});
+
+function siteStub() {
+  return env.SITE.get(env.SITE.idFromName("main"));
+}
+
+describe("SiteDO アラーム 1 周（発見 → ポーリング → state_cache）", () => {
+  it("温湿度が state_cache に入り、残枠が消費される", async () => {
+    const mock = mockFetch({
+      "GET https://api.switch-bot.com/v1.1/devices": () => ({
+        statusCode: 100,
+        message: "success",
+        body: {
+          deviceList: [
+            { deviceId: "ABCD1234", deviceName: "リビング温湿度計", deviceType: "Meter", hubDeviceId: "H1" },
+          ],
+        },
+      }),
+      "GET https://api.switch-bot.com/v1.1/devices/ABCD1234/status": () => ({
+        statusCode: 100,
+        message: "success",
+        body: { deviceId: "ABCD1234", deviceType: "Meter", temperature: 27.5, humidity: 61, battery: 90 },
+      }),
+    });
+
+    const stub = siteStub();
+    await stub.listDevicesRpc(); // 初回アクセス: コンストラクタがアラームを予約する
+    const ran = await runDurableObjectAlarm(stub);
+    expect(ran).toBe(true);
+
+    const states = await stub.getStateRpc();
+    expect(states).toHaveLength(1);
+    expect(states[0]?.device.id).toBe("switchbot:ABCD1234");
+    expect(states[0]?.device.capabilities.map((c) => c.capability).sort()).toEqual([
+      "humidity_read",
+      "temperature_read",
+    ]);
+    expect(states[0]?.state).toMatchObject({ temperature: 27.5, humidity: 61 });
+    expect(states[0]?.source).toBe("poll");
+    expect(mock.calls.get("GET https://api.switch-bot.com/v1.1/devices")).toBe(1);
+    expect(mock.calls.get("GET https://api.switch-bot.com/v1.1/devices/ABCD1234/status")).toBe(1);
+
+    // /devices + /status で残枠 2 消費
+    const budget = await stub.getRateBudgetRpc();
+    expect(budget).toEqual([
+      { vendor: "switchbot", day: jstDay(Date.now()), used: 2, dailyLimit: 10_000, remaining: 9_998 },
+    ]);
+
+    // アラーム連鎖: 次のアラームが再予約されている
+    const next = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+    expect(next).not.toBeNull();
+  });
+
+  it("残枠 95% 消費済みならポーリングを止める（Webhook とコマンドのみ残す）", async () => {
+    mockFetch({}); // HTTP が 1 本でも飛んだら unmocked fetch エラーでテストが落ちる
+
+    const stub = siteStub();
+    const now = Date.now();
+    await runInDurableObject(stub, (_i, state) => {
+      const sql = state.storage.sql;
+      // 発見済み機器 1 台 + 発見は済んだ扱い + 残枠 95% を注入
+      sql.exec(
+        "INSERT INTO devices (id, vendor, vendor_device_id, name, room, capabilities) VALUES (?, ?, ?, ?, ?, ?)",
+        "switchbot:X1",
+        "switchbot",
+        "X1",
+        "温湿度計",
+        "living",
+        JSON.stringify([{ capability: "temperature_read", feedback: "verified" }]),
+      );
+      sql.exec("INSERT INTO kv (key, value) VALUES ('last_discovery', ?)", String(now));
+      sql.exec(
+        "INSERT INTO rate_budget (vendor, day, used, daily_limit) VALUES ('switchbot', ?, 9500, 10000)",
+        jstDay(now),
+      );
+    });
+
+    const ran = await runDurableObjectAlarm(stub);
+    expect(ran).toBe(true);
+
+    const states = await stub.getStateRpc();
+    expect(states[0]?.state).toBeNull(); // ポーリングされていない
+  });
+});
