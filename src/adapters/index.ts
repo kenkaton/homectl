@@ -5,11 +5,13 @@ import type { Env } from "../env";
 import { secretPresent } from "../env";
 import { SwitchBotAdapter } from "./switchbot";
 import { RemoAdapter } from "./remo";
+import { SesameAdapter } from "./sesame";
 
 export function createAdapters(env: Env, http?: Http): Map<string, VendorAdapter> {
   const adapters: VendorAdapter[] = [
     new SwitchBotAdapter(env, http),
     new RemoAdapter(env, http),
+    new SesameAdapter(env, http),
   ];
   return new Map(adapters.map((a) => [a.vendor, a]));
 }

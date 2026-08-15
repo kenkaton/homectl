@@ -98,6 +98,85 @@ describe("SiteDO アラーム 1 周（発見 → ポーリング → state_cache
     expect(states[0]?.state).toBeNull(); // ポーリングされていない
   });
 
+  it("Webhook: 状態が source=webhook で入り、直後のポーリングは間引かれる（D6）", async () => {
+    mockFetch({}); // ポーリングが飛んだら失敗する
+    const stub = siteStub();
+    const now = Date.now();
+    await runInDurableObject(stub, (_i, state) => {
+      const sql = state.storage.sql;
+      sql.exec(
+        "INSERT INTO devices (id, vendor, vendor_device_id, name, room, capabilities) VALUES (?, ?, ?, ?, ?, ?)",
+        "switchbot:MAC1",
+        "switchbot",
+        "MAC1",
+        "温湿度計",
+        "living",
+        JSON.stringify([
+          { capability: "temperature_read", feedback: "verified" },
+          { capability: "humidity_read", feedback: "verified" },
+        ]),
+      );
+      sql.exec("INSERT INTO kv (key, value) VALUES ('last_discovery', ?)", String(now));
+    });
+
+    // SwitchBot webhook payload を DO の fetch に直接投げる（Worker からの委譲と同じ経路）
+    const res = await stub.fetch(
+      new Request("https://do/webhook/switchbot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          eventType: "changeReport",
+          context: { deviceType: "WoMeter", deviceMac: "MAC1", temperature: 22.5, humidity: 45, timeOfSample: now },
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, applied: 1 });
+
+    const states = await stub.getStateRpc("switchbot:MAC1");
+    expect(states[0]?.state).toMatchObject({ temperature: 22.5, humidity: 45 });
+    expect(states[0]?.source).toBe("webhook");
+
+    // 直後のアラームでは webhook で新鮮な機器はポーリングされない（unmocked fetch が飛べば失敗する）
+    await runDurableObjectAlarm(stub);
+    const after = await stub.getStateRpc("switchbot:MAC1");
+    expect(after[0]?.source).toBe("webhook"); // poll で上書きされていない
+
+    // 未知ベンダー・未対応ベンダーは 404
+    const unknown = await stub.fetch(new Request("https://do/webhook/nope", { method: "POST", body: "{}" }));
+    expect(unknown.status).toBe(404);
+  });
+
+  it("オフライン検知: 2時間無応答で通知フラグが立つ（同じ停止期間は1回だけ）", async () => {
+    mockFetch({});
+    const stub = siteStub();
+    const now = Date.now();
+    await runInDurableObject(stub, (_i, state) => {
+      const sql = state.storage.sql;
+      sql.exec(
+        "INSERT INTO devices (id, vendor, vendor_device_id, name, room, capabilities) VALUES ('sw:old','fake','old','古い機器','living','[]')",
+      );
+      sql.exec(
+        "INSERT INTO state_cache (device_id, state, updated_at, source) VALUES ('sw:old', '{}', ?, 'poll')",
+        now - 3 * 3600_000, // 3 時間前
+      );
+      sql.exec("INSERT INTO kv (key, value) VALUES ('last_discovery', ?)", String(now));
+    });
+
+    await runDurableObjectAlarm(stub);
+    const first = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'offline_notified:sw:old'").toArray(),
+    );
+    expect(first).toHaveLength(1);
+
+    // もう 1 周しても通知フラグは更新されない（再通知しない）
+    await runDurableObjectAlarm(stub);
+    const second = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'offline_notified:sw:old'").toArray(),
+    );
+    expect(second).toEqual(first);
+  });
+
   it("閉ループ検証: 期限到来分をアラームで判定し、効いていなければ failed を記録（D5）", async () => {
     mockFetch({}); // 実 HTTP は全て遮断（discovery の失敗は握って続行される）
     const stub = siteStub();

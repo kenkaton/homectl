@@ -74,6 +74,7 @@ export interface VendorAdapter {
   readonly vendor: string; // 一意ID。Device.vendor / rate_budget のキー
   readonly rateLimit?: { perDay: number }; // 宣言すると残枠管理が自動で効く
   readonly requiredSecrets: string[]; // setup.ts が対話取得に使う / 未設定時の自動無効化
+  readonly optionalSecrets?: string[]; // 一部機能にだけ必要な secret（未設定でもアダプタは有効）
 
   // 機器発見。能力と feedback 信頼度の宣言はここで行う（D4/D5 の実装点）
   discoverDevices(): Promise<Omit<Device, "id" | "room">[]>;

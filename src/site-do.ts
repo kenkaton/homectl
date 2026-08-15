@@ -185,6 +185,9 @@ export class SiteDO extends DurableObject<Env> {
         (c) => READABLE.has(c.capability) || (c.capability === "on_off" && c.feedback === "verified"),
       );
       if (!readable) continue;
+      // ポーリング間引き（D6）: Webhook/コマンドで十分新しい状態が来ていれば読まない
+      const cached = store.getCachedState(this.sql, device.id);
+      if (cached && now - cached.updatedAt < ALARM_INTERVAL_MS * 0.9) continue;
       try {
         const state = await adapter.readState(device);
         const merged = store.mergeState(this.sql, device.id, state, "poll", now);
@@ -193,6 +196,28 @@ export class SiteDO extends DurableObject<Env> {
         if (e instanceof BudgetExceededError) return; // このサイクルは打ち切り
         console.error(`poll failed for ${device.id}:`, e instanceof Error ? e.message : String(e));
       }
+    }
+    this.checkOffline(now);
+  }
+
+  /** 機器が 2 時間応答なしなら warn（同じ停止期間について通知は 1 回だけ。§11） */
+  private checkOffline(now: number): void {
+    const OFFLINE_MS = 2 * 3600_000;
+    for (const device of store.listDevices(this.sql)) {
+      const cached = store.getCachedState(this.sql, device.id);
+      if (!cached || now - cached.updatedAt < OFFLINE_MS) continue;
+      const lastNotified = Number(store.getKv(this.sql, `offline_notified:${device.id}`) ?? 0);
+      if (lastNotified >= cached.updatedAt) continue; // この停止期間はもう通知済み
+      store.setKv(this.sql, `offline_notified:${device.id}`, String(now));
+      this.ctx.waitUntil(
+        notifySafe(this.notifier, {
+          level: "warn",
+          kind: "device_offline",
+          title: `機器が ${Math.round((now - cached.updatedAt) / 3600_000)} 時間応答なし: ${device.name}`,
+          detail: `最終更新 ${jstDateTime(cached.updatedAt)} (${cached.source})`,
+          deviceId: device.id,
+        }),
+      );
     }
   }
 
@@ -274,10 +299,53 @@ export class SiteDO extends DurableObject<Env> {
     return used < Math.ceil(limit * 0.95);
   }
 
-  // ---- Webhook 受信（Worker から Request ごと委譲される。Phase 5 で実装） ----
+  // ---- Webhook 受信（Worker から Request ごと委譲される。D6: Webhook 優先） ----
 
-  override async fetch(_req: Request): Promise<Response> {
-    return new Response("webhook handling not implemented yet", { status: 501 });
+  override async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const m = /^\/webhook\/([a-z0-9_-]+)$/.exec(url.pathname);
+    if (!m || req.method !== "POST") return new Response("not found", { status: 404 });
+    // 共有鍵は Worker 側でも検査済みだが、DO 直叩きに備えて二重に見る
+    if (this.env.WEBHOOK_KEY && url.searchParams.get("key") !== this.env.WEBHOOK_KEY) {
+      return new Response("forbidden", { status: 403 });
+    }
+    const vendor = m[1] ?? "";
+    const adapter = this.adapters.get(vendor);
+    if (!adapter?.parseWebhook) return new Response(`no webhook support for '${vendor}'`, { status: 404 });
+
+    let events;
+    try {
+      events = await adapter.parseWebhook(req); // 署名/形式の検証はアダプタ内（§5）
+    } catch (e) {
+      console.error(`webhook parse failed for ${vendor}:`, e instanceof Error ? e.message : String(e));
+      return new Response("bad request", { status: 400 });
+    }
+
+    const now = Date.now();
+    const rooms = new Set<string>();
+    let applied = 0;
+    for (const ev of events) {
+      const row = this.sql
+        .exec<{ id: string }>(
+          "SELECT id FROM devices WHERE vendor = ? AND vendor_device_id = ?",
+          vendor,
+          ev.vendorDeviceId,
+        )
+        .toArray()[0];
+      if (!row) continue; // 未発見の機器からのイベントは無視（次回 discovery で拾う）
+      const device = store.getDevice(this.sql, row.id);
+      if (!device) continue;
+      // イベント時刻が異常（未来・1時間超の過去）なら受信時刻を使う
+      const ts = ev.ts > now || now - ev.ts > 3600_000 ? now : ev.ts;
+      const merged = store.mergeState(this.sql, device.id, ev.state, "webhook", ts);
+      writeTelemetry(this.env.TELEMETRY, device, merged);
+      rooms.add(device.room);
+      applied++;
+    }
+    // Webhook 受信直後の即時評価（該当 room のルールのみ。§7）
+    if (rooms.size > 0) await this.runRules("webhook", [...rooms]);
+    await this.ensureNextAlarm();
+    return Response.json({ ok: true, applied });
   }
 
   // ---- RPC（Worker / MCP から呼ばれる） ----
